@@ -218,3 +218,46 @@ def plot_forward_paths_in_pca(model, X0_np, pca, num_traj=8, num_steps=40, eps=1
     plt.xlabel("PC1"); plt.ylabel("PC2"); plt.grid(True, ls="--", alpha=0.3)
     plt.tight_layout(); plt.show()
 # --- END NEW -----------------------------------------------------------------
+
+
+# ---------- 1) Transport a visualization subset ----------
+vis_n_plasma = 3000
+vis_n_csf    = 2000
+rng = np.random.default_rng(0)
+idx_p = rng.choice(X_plasma_np.shape[0], size=min(vis_n_plasma, X_plasma_np.shape[0]), replace=False)
+idx_c = rng.choice(X_csf_np.shape[0],    size=min(vis_n_csf,    X_csf_np.shape[0]),    replace=False)
+
+X0_vis  = X_plasma_np[idx_p]  # plasma subset
+X1_vis  = X_csf_np[idx_c]     # csf subset
+
+hat_X1_vis = transport_forward_batched(
+    ema_model, X0_vis, batch_size=256, num_steps=100, eps=eps, device=device
+)
+
+# ---------- 2) Fit PCA(10) on pooled [plasma subset; csf subset; transported plasma subset] ----------
+pca = pca_fit([X0_vis, X1_vis, hat_X1_vis], n_components=10)
+
+# ---------- 3) Plots in PCA(2) ----------
+plot_pca_scatter_with_arrows(pca, X0_vis, X1_vis, hat_X1_vis, n_points_arrows=250,
+                             title="Plasma → CSF Schrödinger Bridge (PCA2)")
+
+plot_pca_density_comparison(pca, X1_vis, hat_X1_vis,
+                            title="PC marginals: CSF vs Transported Plasma")
+
+# ---------- 4) Quantitative alignment in PCA(10) ----------
+Z1_10 = pca["transform"](X1_vis)[:, :10]
+Zt_10 = pca["transform"](hat_X1_vis)[:, :10]
+
+mmd2, used_sigma = mmd_rbf(Z1_10, Zt_10, sigma=None, max_samples=2000, seed=0)
+nn_acc = one_nn_two_sample_accuracy(Z1_10, Zt_10, max_samples=2000, seed=0)
+print(f"MMD^2 (RBF, PCA10): {mmd2:.5f}  |  sigma≈{used_sigma:.3f}")
+print(f"1-NN two-sample accuracy (PCA10) — closer to 0.5 is better: {nn_acc:.3f}")
+
+# ---------- 5) Paired held-out evaluation (subset of df_ov if you want to reserve some for testing) ----------
+# Here we just use the whole paired set for a quick sanity check:
+paired_metrics = paired_eval_forward(ema_model, X_ov0_np, X_ov1_np, num_steps=100, eps=eps,
+                                     batch_size=256, device=device)
+print(f"Paired eval: mean MSE={paired_metrics['mse_mean']:.5f}, mean cosine={paired_metrics['cos_mean']:.4f}")
+
+# Optional: view deterministic forward paths for a few plasma points projected to PCA(2)
+plot_forward_paths_in_pca(ema_model, X0_vis, pca, num_traj=8, num_steps=40, eps=eps, device=device)
