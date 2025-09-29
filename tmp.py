@@ -1,212 +1,292 @@
-# ---- NEW: High-capacity feature-gated, FiLM-conditioned residual MLP drift ----
-import math
+# ===========================
+# EVALUATION: HELD-OUT PAIRED
+# ===========================
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-# (Optional) Low-rank Linear to reduce params for huge D
-class LowRankLinear(nn.Module):
-    def __init__(self, in_features, out_features, rank=None, bias=True):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        if rank is None or rank >= min(in_features, out_features):
-            self.A = None
-            self.core = nn.Linear(in_features, out_features, bias=bias)
-        else:
-            self.A = nn.Linear(in_features, rank, bias=False)
-            self.B = nn.Linear(rank, out_features, bias=bias)
-        self.reset_parameters()
+# --- 0) Helpers: standardization / inverse ---
+def apply_standardizer_np(arr, mean, std):
+    return ((arr.astype(np.float32) - mean) / std).astype(np.float32)
 
-    def reset_parameters(self):
-        if self.A is None:
-            # use default init
-            return
-        # Xavier for low-rank pieces
-        nn.init.xavier_uniform_(self.A.weight)
-        nn.init.xavier_uniform_(self.B.weight)
-        if self.B.bias is not None:
-            nn.init.zeros_(self.B.bias)
+def invert_standardizer_np(arr_std, mean, std):
+    return (arr_std * std) + mean
 
-    def forward(self, x):
-        if self.A is None:
-            return self.core(x)
-        return self.B(self.A(x))
-
-# SwiGLU FFN block
-class SwiGLU(nn.Module):
-    def __init__(self, d_model, d_ff):
-        super().__init__()
-        self.w12 = nn.Linear(d_model, d_ff * 2)
-        self.w3  = nn.Linear(d_ff, d_model)
-
-    def forward(self, x):
-        a, b = self.w12(x).chunk(2, dim=-1)  # [B, d_ff] x2
-        return self.w3(F.silu(a) * b)
-
-class FiLMResBlock(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
-        super().__init__()
-        self.ln = nn.LayerNorm(d_model)
-        self.ff = SwiGLU(d_model, d_ff)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x, gamma, beta):
-        """
-        gamma, beta: [B, d_model] FiLM parameters
-        """
-        h = self.ln(x)
-        h = self.ff(h)
-        # FiLM on the block output
-        h = h * (1.0 + gamma) + beta
-        h = self.drop(h)
-        return x + h
-
-def fourier_time_embedding(t, n_f=16):
+# --- 1) Prepare X0 (plasma) / X1 (csf) from df_test ---
+def prepare_test_arrays(df_test, D, mean, std, standardize=True):
     """
-    t: [B,1] in [0,1]
-    returns [B, 2*n_f] with sin/cos features
+    df_test: DataFrame with shape (N, 2D); first D cols plasma, last D cols csf.
+    D: number of proteins/features
+    mean,std: arrays of shape (D,) from training
     """
-    device = t.device
-    freqs = torch.linspace(1.0, 2.0**(n_f-1), n_f, device=device) * (2*math.pi)
-    ang = t * freqs  # [B, n_f]
-    return torch.cat([torch.sin(ang), torch.cos(ang)], dim=1)  # [B, 2*n_f]
+    X0 = df_test.iloc[:, :D].values.astype(np.float32)
+    X1 = df_test.iloc[:,  D:].values.astype(np.float32)
+    if standardize:
+        X0 = apply_standardizer_np(X0, mean, std)
+        X1 = apply_standardizer_np(X1, mean, std)
+    return X0, X1
 
-class GatedFiLMResNetDrift(nn.Module):
+# --- 2) Transport in batches using your existing sampler ---
+@torch.no_grad()
+def transport_forward_batched(model, X_np, batch_size=256, num_steps=100, eps=1.0, device=torch.device("cpu")):
     """
-    High-capacity drift network for high-D proteomics.
-    - Per-feature gates on x with L1 regularization
-    - Sinusoidal time embedding + direction embedding
-    - FiLM-conditioned residual MLP blocks with SwiGLU
-    - Optional low-rank input/output to keep params manageable
+    Plasma -> CSF via forward SDE (uses your existing sample_forward_SDE under the hood if available).
+    If you already have sample_forward_SDE(model, x0, num_steps, eps), you can call it directly here.
     """
-    def __init__(
-        self,
-        x_dim: int,            # number of proteins (or latent dims if training in PCA space)
-        d_model: int = 512,
-        n_blocks: int = 6,
-        ff_mult: int = 4,
-        dropout: float = 0.1,
-        time_fourier: int = 16,
-        dir_emb_dim: int = 8,
-        in_rank: int | None = None,   # e.g., 256 to reduce params from x_dim->d_model
-        out_rank: int | None = None   # e.g., 256 for d_model->x_dim
-    ):
-        super().__init__()
-        self.x_dim = x_dim
+    model.eval()
+    N, D = X_np.shape
+    out = np.empty_like(X_np, dtype=np.float32)
+    n_batches = (N + batch_size - 1) // batch_size
+    for b in range(n_batches):
+        sl = slice(b * batch_size, min((b + 1) * batch_size, N))
+        x0 = torch.from_numpy(X_np[sl]).to(device, non_blocking=True)
+        # Reuse your sampler
+        hat_x1 = sample_forward_SDE(model, x0, num_steps=num_steps, eps=eps)
+        out[sl] = hat_x1.detach().cpu().numpy().astype(np.float32)
+    return out
 
-        # --- Feature gates (sigmoid(g_logits) in (0,1)) ---
-        init_gate = 0.5
-        init_logit = math.log(init_gate / (1.0 - init_gate))
-        self.g_logits = nn.Parameter(torch.full((x_dim,), float(init_logit)))
+# --- 3) Metrics: MSE and R^2 along chosen axis ---
+def mse_along_axis(y_true, y_pred, axis=0):
+    """
+    axis=0 -> per-feature across individuals (shape [D])
+    axis=1 -> per-sample across features (shape [N])
+    """
+    diff = y_pred - y_true
+    return np.mean(diff * diff, axis=axis)
 
-        # --- Input projection (optionally low-rank) ---
-        self.x_in = LowRankLinear(x_dim, d_model, rank=in_rank, bias=True)
+def r2_along_axis(y_true, y_pred, axis=0, eps=1e-12):
+    """
+    R^2 = 1 - SSE/SST computed along axis.
+    axis=0 -> per-feature R^2 across individuals.
+    axis=1 -> per-sample R^2 across features.
+    Handles zero-variance targets by returning NaN for those entries.
+    """
+    y_true_mean = np.mean(y_true, axis=axis, keepdims=True)
+    sse = np.sum((y_pred - y_true) ** 2, axis=axis)
+    sst = np.sum((y_true - y_true_mean) ** 2, axis=axis)
+    r2 = 1.0 - (sse / (sst + eps))
+    # Mark truly zero-variance targets as NaN (uninformative)
+    zero_var = sst < eps
+    if axis == 0:
+        r2[zero_var] = np.nan
+    else:
+        r2 = np.where(zero_var, np.nan, r2)
+    return r2
 
-        # --- Direction embedding (two categories: 0 backward, 1 forward) ---
-        self.s_emb = nn.Embedding(2, dir_emb_dim)
+# --- 4) End-to-end evaluation on df_test ---
+def evaluate_transport_on_test(
+    model,
+    df_test,
+    mean,
+    std,
+    device,
+    D,
+    batch_size=256,
+    num_steps=100,
+    eps=0.1,
+    compute_on_original_scale=False
+):
+    """
+    Returns a dict with predictions and metrics on BOTH standardized scale (always)
+    and original scale (optional).
+    """
+    # Prepare standardized arrays
+    X0_std, X1_std = prepare_test_arrays(df_test, D, mean, std, standardize=True)
+    # Transport
+    hat_X1_std = transport_forward_batched(model, X0_std, batch_size=batch_size, num_steps=num_steps, eps=eps, device=device)
 
-        # --- Conditioning network to produce FiLM params for each block ---
-        cond_dim = 2 * time_fourier + dir_emb_dim
-        self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-        )
-        # one gamma & beta per block, each of size d_model
-        self.to_film = nn.Linear(d_model, n_blocks * 2 * d_model)
+    # Metrics on standardized scale
+    per_feat_mse_std = mse_along_axis(X1_std, hat_X1_std, axis=0)   # [D]
+    per_feat_r2_std  = r2_along_axis(X1_std, hat_X1_std, axis=0)    # [D]
+    per_samp_mse_std = mse_along_axis(X1_std, hat_X1_std, axis=1)   # [N]
+    per_samp_r2_std  = r2_along_axis(X1_std, hat_X1_std, axis=1)    # [N]
 
-        # --- Residual stack ---
-        d_ff = ff_mult * d_model
-        self.blocks = nn.ModuleList([FiLMResBlock(d_model, d_ff, dropout=dropout) for _ in range(n_blocks)])
+    out = {
+        "hat_X1_std": hat_X1_std,
+        "X1_std": X1_std,
+        "X0_std": X0_std,
+        "per_feature": {
+            "mse_std": per_feat_mse_std,
+            "r2_std":  per_feat_r2_std,
+        },
+        "per_sample": {
+            "mse_std": per_samp_mse_std,
+            "r2_std":  per_samp_r2_std,
+        },
+        "summary_std": {
+            "mse_mean": float(np.mean(per_samp_mse_std)),
+            "r2_feature_mean": float(np.nanmean(per_feat_r2_std)),
+            "r2_sample_mean":  float(np.nanmean(per_samp_r2_std)),
+        }
+    }
 
-        # --- Output head (optionally low-rank) ---
-        self.out_ln = nn.LayerNorm(d_model)
-        self.out = LowRankLinear(d_model, x_dim, rank=out_rank, bias=True)
+    if compute_on_original_scale:
+        # De-standardize for interpretability on raw units
+        X1 = invert_standardizer_np(X1_std, mean, std)
+        hat_X1 = invert_standardizer_np(hat_X1_std, mean, std)
+        per_feat_mse = mse_along_axis(X1, hat_X1, axis=0)
+        per_feat_r2  = r2_along_axis(X1, hat_X1, axis=0)
+        per_samp_mse = mse_along_axis(X1, hat_X1, axis=1)
+        per_samp_r2  = r2_along_axis(X1, hat_X1, axis=1)
+        out.update({
+            "hat_X1": hat_X1,
+            "X1": X1,
+            "per_feature_raw": {
+                "mse": per_feat_mse,
+                "r2":  per_feat_r2,
+            },
+            "per_sample_raw": {
+                "mse": per_samp_mse,
+                "r2":  per_samp_r2,
+            },
+            "summary_raw": {
+                "mse_mean": float(np.mean(per_samp_mse)),
+                "r2_feature_mean": float(np.nanmean(per_feat_r2)),
+                "r2_sample_mean":  float(np.nanmean(per_samp_r2)),
+            }
+        })
 
-        # Scale residuals a bit for stability
-        self.register_buffer("res_scale", torch.tensor(1.0 / math.sqrt(n_blocks)))
+    return out
 
-    def gate_l1(self):
-        # L1 on gate magnitudes (post-sigmoid). Encourages sparsity.
-        return torch.sigmoid(self.g_logits).abs().sum()
+# --- 5) Visualization utilities ---
+def plot_metric_histograms(per_feature_mse, per_feature_r2, per_sample_mse, per_sample_r2, title_suffix="(standardized)"):
+    fig, axs = plt.subplots(2, 2, figsize=(12, 8))
+    axs = axs.ravel()
 
-    def forward(self, s, t, x):
-        """
-        s: [B,1] (float 0/1)    direction
-        t: [B,1]                time
-        x: [B, x_dim]           input features
-        Returns: drift [B, x_dim]
-        """
-        if t.dim() == 1: t = t.unsqueeze(1)
-        # Apply feature gates
-        g = torch.sigmoid(self.g_logits)              # [x_dim]
-        xg = x * g                                     # [B, x_dim]
+    axs[0].hist(per_feature_mse, bins=60, alpha=0.8)
+    axs[0].set_title("Per-feature MSE " + title_suffix)
+    axs[0].set_xlabel("MSE"); axs[0].set_ylabel("# proteins"); axs[0].grid(True, ls="--", alpha=0.3)
 
-        # Project to model dim
-        h = self.x_in(xg)                              # [B, d_model]
+    axs[1].hist(per_feature_r2[~np.isnan(per_feature_r2)], bins=60, alpha=0.8)
+    axs[1].set_title("Per-feature R² " + title_suffix)
+    axs[1].set_xlabel("R²"); axs[1].set_ylabel("# proteins"); axs[1].grid(True, ls="--", alpha=0.3)
 
-        # Build conditioning (time fourier + direction embedding)
-        t_feat = fourier_time_embedding(t, n_f=self.cond_mlp[0].in_features // 2)  # but we set time_fourier, not used here
-        # fix: compute t_feat with the chosen time_fourier explicitly
-                # Recompute t_feat correctly with explicit time_fourier
-        # (work around static access to constructor arg)
-        # We'll infer n_f from cond input size: cond_mlp first layer in_features = 2*time_fourier + dir_emb_dim
-        cond_in = self.cond_mlp[0].in_features
-        # We stored dir_emb_dim as s_emb.embedding_dim; so:
-        dir_dim = self.s_emb.embedding_dim
-        n_f = (cond_in - dir_dim) // 2
-        t_feat = fourier_time_embedding(t, n_f=n_f)    # [B, 2*n_f]
+    axs[2].hist(per_sample_mse, bins=60, alpha=0.8)
+    axs[2].set_title("Per-sample MSE " + title_suffix)
+    axs[2].set_xlabel("MSE"); axs[2].set_ylabel("# individuals"); axs[2].grid(True, ls="--", alpha=0.3)
 
-        s_idx = s.round().long().clamp(0, 1).view(-1)  # [B]
-        s_feat = self.s_emb(s_idx)                     # [B, dir_emb_dim]
+    axs[3].hist(per_sample_r2[~np.isnan(per_sample_r2)], bins=60, alpha=0.8)
+    axs[3].set_title("Per-sample R² " + title_suffix)
+    axs[3].set_xlabel("R²"); axs[3].set_ylabel("# individuals"); axs[3].grid(True, ls="--", alpha=0.3)
 
-        cond = torch.cat([t_feat, s_feat], dim=1)      # [B, 2*n_f + dir_emb_dim]
-        c = self.cond_mlp(cond)                        # [B, d_model]
-        film_all = self.to_film(c)                     # [B, n_blocks*2*d_model]
-        B, _ = film_all.shape
-        # reshape to per-block gamma/beta
-        n_blocks = len(self.blocks)
-        d_model = self.blocks[0].ln.normalized_shape[0]
-        film_all = film_all.view(B, n_blocks, 2, d_model)
-        gammas = film_all[:, :, 0, :]                  # [B, n_blocks, d_model]
-        betas  = film_all[:, :, 1, :]                  # [B, n_blocks, d_model]
+    plt.tight_layout()
+    plt.show()
 
-        # Residual stack with FiLM
-        for i, blk in enumerate(self.blocks):
-            h = h + self.res_scale * blk(h, gammas[:, i, :], betas[:, i, :])
+def plot_topk_feature_parity_scatter(X_true, X_pred, r2_per_feature, feature_names=None, k=6, max_points=3000, seed=0, title_prefix="Top-k feature parity"):
+    """
+    For the top-k proteins by R², plot y_true vs y_pred across individuals.
+    """
+    rng = np.random.default_rng(seed)
+    valid = np.where(~np.isnan(r2_per_feature))[0]
+    if valid.size == 0:
+        print("No valid features for parity scatter.")
+        return
+    order = valid[np.argsort(-r2_per_feature[valid])]
+    top_idx = order[:min(k, order.size)]
+    ncols = min(3, len(top_idx))
+    nrows = int(np.ceil(len(top_idx) / ncols))
+    plt.figure(figsize=(5*ncols, 4*nrows))
+    for i, j in enumerate(top_idx):
+        yt = X_true[:, j]
+        yp = X_pred[:, j]
+        if yt.shape[0] > max_points:
+            sub = rng.choice(yt.shape[0], size=max_points, replace=False)
+            yt, yp = yt[sub], yp[sub]
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.scatter(yt, yp, s=8, alpha=0.5)
+        ax.plot([yt.min(), yt.max()], [yt.min(), yt.max()], 'k--', lw=1)
+        fname = feature_names[j] if (feature_names is not None) else f"Protein {j}"
+        ax.set_title(f"{fname} | R²={r2_per_feature[j]:.3f}")
+        ax.set_xlabel("True CSF"); ax.set_ylabel("Pred CSF"); ax.grid(True, ls="--", alpha=0.3)
+    plt.suptitle(title_prefix)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
 
-        # Output head
-        h = self.out_ln(h)
-        drift = self.out(h)                            # [B, x_dim]
-        return drift
-# ---- END NEW ----------------------------------------------------------------
+def plot_sample_parity_scatter(X_true, X_pred, sample_indices=None, max_points=5000, seed=0, title_prefix="Per-sample parity across proteins"):
+    """
+    For selected individuals, plot true vs predicted across ALL proteins (subsampled for readability).
+    """
+    rng = np.random.default_rng(seed)
+    N, D = X_true.shape
+    if sample_indices is None:
+        sample_indices = [0]
+    ncols = min(3, len(sample_indices))
+    nrows = int(np.ceil(len(sample_indices) / ncols))
+    plt.figure(figsize=(5*ncols, 4*nrows))
+    for i, idx in enumerate(sample_indices[:ncols*nrows]):
+        yt = X_true[idx]
+        yp = X_pred[idx]
+        if D > max_points:
+            sub = rng.choice(D, size=max_points, replace=False)
+            yt, yp = yt[sub], yp[sub]
+        ax = plt.subplot(nrows, ncols, i+1)
+        ax.scatter(yt, yp, s=6, alpha=0.5)
+        lo = min(yt.min(), yp.min()); hi = max(yt.max(), yp.max())
+        ax.plot([lo, hi], [lo, hi], 'k--', lw=1)
+        ax.set_title(f"Sample {idx}")
+        ax.set_xlabel("True CSF"); ax.set_ylabel("Pred CSF"); ax.grid(True, ls="--", alpha=0.3)
+    plt.suptitle(title_prefix)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+def ranked_feature_table(r2_per_feature, feature_names=None, top=20):
+    """
+    Utility: print top/bottom features by R² for quick inspection.
+    """
+    valid = np.where(~np.isnan(r2_per_feature))[0]
+    if valid.size == 0:
+        print("No valid features.")
+        return
+    order = valid[np.argsort(-r2_per_feature[valid])]
+    top_idx = order[:min(top, order.size)]
+    print("\nTop features by R²:")
+    for j in top_idx:
+        name = feature_names[j] if (feature_names is not None) else f"Protein {j}"
+        print(f"{name:>24s}  R²={r2_per_feature[j]:.4f}")
+    bot_idx = valid[np.argsort(r2_per_feature[valid])][:min(top, valid.size)]
+    print("\nBottom features by R² (excluding NaN):")
+    for j in bot_idx:
+        name = feature_names[j] if (feature_names is not None) else f"Protein {j}"
+        print(f"{name:>24s}  R²={r2_per_feature[j]:.4f}")
 
 
-D = X_plasma_np.shape[1]  # 7290
-model = GatedFiLMResNetDrift(
-    x_dim=D,
-    d_model=512,
-    n_blocks=8,
-    ff_mult=4,
-    dropout=0.1,
-    time_fourier=16,
-    dir_emb_dim=8,
-    in_rank=256,   # try None if you want full-rank; 256 keeps params lighter
-    out_rank=256,
-).to(device)
+# Assuming:
+# - ema_model (or model) is trained
+# - df_test is your held-out paired DataFrame
+# - mean, std are the training standardization stats (shape [D,])
+# - device, eps, and num_steps are the ones you used during training/eval
+D = df_test.shape[1] // 2
+results = evaluate_transport_on_test(
+    ema_model, df_test, mean, std, device,
+    D=D, batch_size=256, num_steps=100, eps=eps,
+    compute_on_original_scale=False  # set True if you want raw-unit metrics too
+)
 
-ema_model = GatedFiLMResNetDrift(
-    x_dim=D,
-    d_model=512,
-    n_blocks=8,
-    ff_mult=4,
-    dropout=0.1,
-    time_fourier=16,
-    dir_emb_dim=8,
-    in_rank=256,
-    out_rank=256,
-).to(device)
-ema_model.load_state_dict(model.state_dict())
+# Summaries (standardized scale)
+print("=== Standardized-scale summary ===")
+print(results["summary_std"])
+per_feat_mse = results["per_feature"]["mse_std"]
+per_feat_r2  = results["per_feature"]["r2_std"]
+per_samp_mse = results["per_sample"]["mse_std"]
+per_samp_r2  = results["per_sample"]["r2_std"]
+
+# Histograms
+plot_metric_histograms(per_feat_mse, per_feat_r2, per_samp_mse, per_samp_r2, title_suffix="(standardized)")
+
+# Parity plots for top-k proteins by R²
+feature_names = list(df_test.columns[:D])  # optional, if your columns are protein names
+plot_topk_feature_parity_scatter(
+    results["X1_std"], results["hat_X1_std"], per_feat_r2,
+    feature_names=feature_names, k=6, max_points=3000,
+    title_prefix="Top-6 proteins parity (standardized)"
+)
+
+# Parity across proteins for selected individuals
+plot_sample_parity_scatter(
+    results["X1_std"], results["hat_X1_std"],
+    sample_indices=[0, 1, 2], max_points=5000,
+    title_prefix="Sample-level parity across proteins (standardized)"
+)
+
+# Optional: print ranked features by R²
+ranked_feature_table(per_feat_r2, feature_names=feature_names, top=15)
